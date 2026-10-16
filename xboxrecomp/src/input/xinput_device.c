@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -257,26 +258,72 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
+/* Give every attached game controller a free slot, in SDL's order.
+ * A controller already in a slot keeps it. */
 static void open_controllers(void)
 {
-    int slot = 0;
-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        SDL_JoystickID id;
+        int slot, taken = 0;
+
         if (!SDL_IsGameController(i))
             continue;
-        if (!g_pads[slot]) {
-            g_pads[slot] = SDL_GameControllerOpen(i);
-            g_controller_connected[slot] = (g_pads[slot] != NULL);
-        }
-        slot++;
+        id = SDL_JoystickGetDeviceInstanceID(i);
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+            if (g_pads[slot] && SDL_JoystickInstanceID(
+                    SDL_GameControllerGetJoystick(g_pads[slot])) == id)
+                taken = 1;
+        if (taken)
+            continue;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS && g_pads[slot]; slot++)
+            ;
+        if (slot == XBOX_MAX_CONTROLLERS)
+            return;
+        g_pads[slot] = SDL_GameControllerOpen(i);
+        g_controller_connected[slot] = (g_pads[slot] != NULL);
+        if (g_pads[slot])
+            fprintf(stderr, "  [INPUT] pad %d: %s\n", slot,
+                    SDL_GameControllerName(g_pads[slot]));
     }
 }
 
 void xbox_InputInit(void)
 {
+    /* Steam (and the Deck's gaming mode) give the window the focus only
+     * some of the time; a racing game should still steer when it lacks it. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
+}
+
+/* Nothing in the runtime calls xbox_InputInit on Linux, and a pad can be
+ * plugged in (or Steam Input can swap the Deck's raw device for its virtual
+ * one) after boot, so the poll opens controllers itself: on the first call
+ * and whenever the number of joysticks changes. Detached pads are closed so
+ * their slot can be reused. */
+static void refresh_controllers(void)
+{
+    static int inited, last_count = -1;
+    int n;
+
+    if (!inited) {
+        inited = 1;
+        xbox_InputInit();
+    }
+    for (int s = 0; s < XBOX_MAX_CONTROLLERS; s++)
+        if (g_pads[s] && !SDL_GameControllerGetAttached(g_pads[s])) {
+            SDL_GameControllerClose(g_pads[s]);
+            g_pads[s] = NULL;
+            g_controller_connected[s] = FALSE;
+            last_count = -1;
+        }
+    SDL_JoystickUpdate();
+    n = SDL_NumJoysticks();
+    if (n != last_count) {
+        last_count = n;
+        open_controllers();
+    }
 }
 
 #if defined(__SWITCH__)
@@ -314,13 +361,13 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     }
 #endif
 
+    refresh_controllers();
+
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-
-    SDL_GameControllerUpdate();
     g_controller_connected[dwPort] = TRUE;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
