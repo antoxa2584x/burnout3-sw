@@ -295,7 +295,9 @@ typedef struct {
  * horizontal scale outright (a game option's rescale keeps the ratio).
  * s_square: widescreen shows the title's 640x480 at 16:9, so surfaces
  * without horizontal AA get 4/3 more columns -- square pixels (races: 1.5x
- * -> 1280x720). The front end's 1280x480 (aa 2x1) is wide enough already.
+ * -> 1280x720); surfaces with horizontal AA get 4/3 divided by it (a
+ * 1280x480 aa 2x1 surface: 1280x720 at 1.5x, not 1920x720 -- the title's
+ * horizontal supersampling is dropped).
  * RECOMP_VK_SQUARE=0 off; RECOMP_GL_SCALE_X overrides it. */
 static double   s_scale = 1.0, s_scale_x = 1.0, s_xratio = 1.0;
 static int      s_square, s_square_env;
@@ -319,7 +321,7 @@ volatile int nv2a_vk_scale_pct;
  * by the device's image limits. */
 static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
 {
-    double kx = s_scale_x * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale;
+    double kx = s_scale_x * (s_square ? 4.0 / 3.0 / (aa_sx > 1 ? aa_sx : 1) : 1.0), ky = s_scale;
     if (w * kx > (double)s_max_size)
         kx = (double)s_max_size / w;
     if (h * ky > (double)s_max_size)
