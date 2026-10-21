@@ -4,6 +4,18 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.4] - 2026-10-21
+
+### Fixed
+- The sun's lens flare shone through bridges and buildings (#10): the
+  GPU's visibility test results, which the game dims the flare by, were
+  never written. Vulkan and GL now count them with occlusion queries.
+- Traffic cars changed colour from frame to frame (#11): cars sharing a
+  paletted skin all took the palette of the first one drawn.
+- v0.2.1 ran much slower than v0.2 with sys-clk installed (#9): the
+  `NFSU2_*_MHZ` clocks were ignored whenever sys-clk was running, leaving
+  the CPU at stock 1020 MHz. They are ignored only under Horizon OC now.
+
 ## [0.2] - 2026-10-11
 
 ### Fixed
