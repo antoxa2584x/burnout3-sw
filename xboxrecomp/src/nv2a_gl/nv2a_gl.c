@@ -347,6 +347,7 @@ static GlSurf *surf_bind(const Nv2aSurface *sf, uint32_t zeta_va)
 
 typedef struct {
     uint32_t va, color, w, h, pitch, hash, bytes;
+    uint32_t pal;               /* palette VA for 0x0B, else 0 */
     GLuint   tex;
     uint32_t used, checked;
 } GlTex;
@@ -545,10 +546,16 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
     GlTex *t = NULL, *victim = NULL;
     uint32_t i, hash;
     Nv2aTexture nt;
+    /* An indexed texture is one image per palette: Burnout 3's traffic
+     * shares its paint indices and gives each car a palette. Keyed by
+     * address alone, every car took the palette of the first one drawn
+     * that frame, and the colours swapped from frame to frame (#11). */
+    uint32_t pal = color == 0x0B ? s_palette_va : 0;
 
     for (i = s_tex_head[tex_bucket(va, color, w, h)]; i; i = s_tex_next[i - 1]) {
         GlTex *c = &s_tex[i - 1];
-        if (c->tex && c->va == va && c->color == color && c->w == w && c->h == h) {
+        if (c->tex && c->va == va && c->color == color && c->w == w && c->h == h
+            && c->pal == pal) {
             t = c;
             break;
         }
@@ -581,7 +588,7 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
             tex_index_del(t);
         }
         memset(t, 0, sizeof *t);
-        t->va = va; t->color = color; t->w = w; t->h = h;
+        t->va = va; t->color = color; t->w = w; t->h = h; t->pal = pal;
         tex_index_add(t);
         glGenTextures(1, &t->tex);
         tex_param_forget(t->tex);
@@ -1599,6 +1606,64 @@ static int upload_vertices(const Nv2aRawBatch *b)
     return 1;
 }
 
+/* ── Visibility tests ─────────────────────────────────────────────────
+ *
+ * As in nv2a_vk.c: every draw made with SET_ZPASS_PIXEL_COUNT_ENABLE on
+ * runs in a GL_SAMPLES_PASSED query, GET_REPORT queues a report summing the
+ * queries since CLEAR_REPORT_VALUE, and each flip writes the reports whose
+ * queries have finished, oldest first (Burnout 3's sun, issue #10). All on
+ * the thread that owns the context. Queries are a ring, counted ever. */
+#define GL_VIS_QUERIES 512
+#define GL_VIS_REPORTS 64
+static GLuint   s_vis_q[GL_VIS_QUERIES];
+static float    s_vis_scale[GL_VIS_QUERIES];
+static uint32_t s_vis_head;             /* queries begun */
+static uint32_t s_vis_q0;               /* first query of the count in progress */
+static struct { uint32_t va, q0, q1; } s_vis_rep[GL_VIS_REPORTS];
+static uint32_t s_vis_rhead, s_vis_rtail;
+
+/* Room for another query: none of the ring is still wanted. */
+static int vis_room(void)
+{
+    uint32_t oldest = s_vis_rhead != s_vis_rtail
+                    ? s_vis_rep[s_vis_rtail % GL_VIS_REPORTS].q0 : s_vis_q0;
+    if (!s_vis_q[0])
+        glGenQueries(GL_VIS_QUERIES, s_vis_q);
+    return s_vis_head - oldest < GL_VIS_QUERIES;
+}
+
+static void vis_poll(void)
+{
+    while (s_vis_rhead != s_vis_rtail) {
+        uint32_t k = s_vis_rtail % GL_VIS_REPORTS, q;
+        GLuint done = 1, n;
+        double sum = 0;
+        if (s_vis_rep[k].q1 != s_vis_rep[k].q0)
+            glGetQueryObjectuiv(s_vis_q[(s_vis_rep[k].q1 - 1) % GL_VIS_QUERIES],
+                                GL_QUERY_RESULT_AVAILABLE, &done);
+        if (!done)
+            break;                              /* they finish in order */
+        for (q = s_vis_rep[k].q0; q != s_vis_rep[k].q1; q++) {
+            glGetQueryObjectuiv(s_vis_q[q % GL_VIS_QUERIES], GL_QUERY_RESULT, &n);
+            sum += (double)n * s_vis_scale[q % GL_VIS_QUERIES];
+        }
+        nv2a_pb_write_report(s_vis_rep[k].va, (uint32_t)(sum + 0.5));
+        s_vis_rtail++;
+    }
+}
+
+static void gl_report(uint32_t op, uint32_t va)
+{
+    if (op == NV2A_REPORT_CLEAR) {
+        s_vis_q0 = s_vis_head;
+    } else if (s_vis_rhead - s_vis_rtail < GL_VIS_REPORTS) {   /* else it stays incomplete */
+        uint32_t k = s_vis_rhead++ % GL_VIS_REPORTS;
+        s_vis_rep[k].va = va;
+        s_vis_rep[k].q0 = s_vis_q0;
+        s_vis_rep[k].q1 = s_vis_head;
+    }
+}
+
 static void gl_draw_raw(const Nv2aRawBatch *b)
 {
     GlSurf *s;
@@ -1909,7 +1974,19 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                     draws, s->va, s->w, s->h, b->prim, n, b->vertex_count,
                     b->attr_present, b->xform, b->vp_start, pk.shader_program, pk.control,
                     r[0x1B00 / 4], (r[0x1B04 / 4] >> 8) & 0xFF);
-        glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+        {
+            int vq = (r[0x17CC / 4] & 1) && vis_room();
+            if (vq) {
+                s_vis_scale[s_vis_head % GL_VIS_QUERIES] =
+                    (float)((double)s->w * s->h / ((double)s->pw * s->ph));
+                glBeginQuery(GL_SAMPLES_PASSED, s_vis_q[s_vis_head % GL_VIS_QUERIES]);
+            }
+            glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+            if (vq) {
+                glEndQuery(GL_SAMPLES_PASSED);
+                s_vis_head++;
+            }
+        }
         gl_step_done("draw");
         if (s_watch_hit) {
             /* What the watched draw left: the target's centre and corner. */
@@ -2031,6 +2108,7 @@ static void gl_flip(void)
 
     if (!ready())
         return;
+    vis_poll();
     s_frame++;
     {
         /* A frame over 50 ms (a hitch): say what it did -- compiling programs
@@ -2203,7 +2281,7 @@ swap:
 #include <pthread.h>
 #include <time.h>
 
-enum { Q_WRAP = 0, Q_DRAW = 1, Q_CLEAR = 2, Q_FLIP = 3 };
+enum { Q_WRAP = 0, Q_DRAW = 1, Q_CLEAR = 2, Q_FLIP = 3, Q_REPORT = 4 };
 typedef struct { uint32_t type, size, nreg, nprog, nconst, pad[3]; } QHdr;
 typedef struct { uint32_t idx, pad[3]; uint32_t w[16]; } QRegChunk;   /* 64 B of shadow */
 typedef struct { uint32_t idx, pad[3]; uint32_t w[4]; } QRow;         /* 16 B row */
@@ -2478,6 +2556,18 @@ static void q_flip(void)
     q_publish(size);
 }
 
+static void q_report(uint32_t op, uint32_t va)
+{
+    uint32_t nreg = q_reg_collect();
+    size_t size = sizeof(QHdr) + (size_t)nreg * sizeof(QRegChunk) + 16;
+    uint8_t *rec = q_reserve(size);
+    size_t at = q_write_state(rec, Q_REPORT, nreg, 0, 0, NULL);
+    ((uint32_t *)(rec + at))[0] = op;
+    ((uint32_t *)(rec + at))[1] = va;
+    ((QHdr *)rec)->size = (uint32_t)size;
+    q_publish(size);
+}
+
 static void *q_gl_thread(void *arg)
 {
     extern void xbox_nx_spread_thread(void);
@@ -2535,6 +2625,8 @@ static void *q_gl_thread(void *arg)
             } else if (h->type == Q_CLEAR) {
                 const QClear *c = (const QClear *)(rec + at);
                 gl_clear(&c->s, &c->rs, c->flags, c->argb, c->zs);
+            } else if (h->type == Q_REPORT) {
+                gl_report(((const uint32_t *)(rec + at))[0], ((const uint32_t *)(rec + at))[1]);
             } else if (h->type == Q_FLIP) {
                 gl_flip();
                 __atomic_sub_fetch(&s_q_flips, 1, __ATOMIC_ACQ_REL);
@@ -2586,6 +2678,7 @@ static Nv2aBackend s_backend_q = {
     q_flip,
     q_draw,
     NV2A_BACKEND_RAW_DIRECT,
+    q_report,
 };
 
 static const Nv2aBackend s_backend_gl = {
@@ -2594,6 +2687,7 @@ static const Nv2aBackend s_backend_gl = {
     gl_flip,
     gl_draw_raw,
     NV2A_BACKEND_RAW_DIRECT,
+    gl_report,
 };
 
 void nv2a_gl_install(void)

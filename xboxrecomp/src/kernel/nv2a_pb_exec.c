@@ -1027,6 +1027,40 @@ void nv2a_backend_register(const Nv2aBackend *backend)
     s_backend = backend;
 }
 
+/* The 16-byte report GET_REPORT names: a timestamp, the pixel count, and a
+ * status word, 0 once the GPU has written it. XDK D3D's EndVisibilityTest
+ * (Burnout 3: 0x0034DFE0) sets the slot's status to 0xFFFFFFFF and passes
+ * (physical & 0x0EFFFFFF) | 0x01000000 -- the report type in bit 24, over
+ * whatever that bit of the address was. A real Xbox keeps it clear; this
+ * runtime's contiguous memory need not, so of the two addresses it could
+ * be, the one D3D marked incomplete is the slot. 0: neither. */
+static uint32_t report_va(uint32_t param)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t phys = param & 0x0EFFFFFFu;
+    int k;
+
+    for (k = 0; k < 2; k++, phys |= 0x01000000u) {
+        uint32_t va = dma_resolve(phys);
+        if (va && *(const volatile uint32_t *)(mem + va + 12) == 0xFFFFFFFFu)
+            return va;
+    }
+    return 0;
+}
+
+void nv2a_pb_write_report(uint32_t va, uint32_t pixels)
+{
+    static uint32_t stamp;
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    volatile uint32_t *slot = (volatile uint32_t *)(mem + va);
+
+    slot[0] = ++stamp;
+    slot[1] = 0;
+    slot[2] = pixels;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    slot[3] = 0;                                /* done */
+}
+
 static void current_surface(Nv2aSurface *out)
 {
     out->color_va        = dma_resolve(s_gpu.color_offset);
@@ -4151,6 +4185,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_reg[w] != param) {
             s_reg[w] = param;
             s_reg_dirty[w >> 4] = 1;
+        }
+    }
+    /* CLEAR_REPORT_VALUE / GET_REPORT: visibility tests, counted by the back
+     * end (SET_ZPASS_PIXEL_COUNT_ENABLE is in the shadow it gets with every
+     * draw). Without one that counts, the report stays as D3D left it,
+     * incomplete. */
+    if (subch == 0 && (method == 0x17C8 || method == 0x17D0)) {
+        if (s_ftrace_on)
+            fprintf(stderr, "[FTRACE] %s %08X\n",
+                    method == 0x17C8 ? "clear report" : "get report", param);
+        if (s_backend && s_backend->report) {
+            uint32_t va = method == 0x17D0 ? report_va(param) : 0;
+            if (method == 0x17C8)
+                s_backend->report(NV2A_REPORT_CLEAR, 0);
+            else if (va)
+                s_backend->report(NV2A_REPORT_GET, va);
         }
     }
     if (pb_verbose() && (method == 0x17C4 || (method >= 0x0C00 && method < 0x0C24))) {

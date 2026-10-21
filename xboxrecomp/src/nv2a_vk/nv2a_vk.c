@@ -163,6 +163,8 @@ static VkDeviceMemory alloc_mem(VkMemoryRequirements rq, VkMemoryPropertyFlags w
 
 #define VK_FRAMES 2
 #define RING_BYTES (48u << 20)
+#define VK_VIS_QUERIES 256      /* occlusion queries a frame */
+#define VK_VIS_REPORTS 64       /* visibility reports a frame */
 
 typedef struct {
     VkImage image; VkImageView view; VkDeviceMemory mem; VkPipeline pipe;
@@ -180,6 +182,13 @@ typedef struct {
     int             submitted;
     Garbage        *garbage;
     uint32_t        ngarbage, garbage_cap;
+    /* Visibility tests: one occlusion query per counted draw, with the
+     * factor that takes the render scale back out, and the reports whose
+     * counts those queries make up (read once the fence has passed). */
+    VkQueryPool     vis_pool;
+    uint32_t        vis_used, vis_nrep;
+    float           vis_scale[VK_VIS_QUERIES];
+    struct { uint32_t va, q0, q1; double carry; } vis_rep[VK_VIS_REPORTS];
 } Frame;
 
 static Frame  s_fr[VK_FRAMES];
@@ -223,6 +232,73 @@ static void garbage_free(Frame *f)
     f->ngarbage = 0;
 }
 
+/* ── Visibility tests ─────────────────────────────────────────────────
+ *
+ * D3D's Begin/EndVisibilityTest: the draws made between
+ * SET_ZPASS_PIXEL_COUNT_ENABLE 1 and 0 count the pixels that pass the depth
+ * test, and GET_REPORT writes that count to a slot D3D polls. Burnout 3
+ * draws its sun so before the lens flare and scales the flare by it; with
+ * the slots never written every test stayed incomplete and the flare shone
+ * through bridges and buildings (issue #10). Each counted draw runs in an
+ * occlusion query; a report sums the queries since CLEAR_REPORT_VALUE and
+ * is written when its frame's fence has passed, a frame or two late, which
+ * D3D reports as "incomplete" meanwhile, as a busy GPU would. */
+static int s_vis_precise;
+static uint32_t s_vis_q0;               /* first query of the count in progress */
+static double s_vis_carry;              /* its pixels from queries already read */
+
+static double vis_sum(Frame *f, uint32_t q0, uint32_t q1)
+{
+    uint64_t res[VK_VIS_QUERIES];
+    double sum = 0;
+    uint32_t q;
+    if (q1 <= q0 || vkGetQueryPoolResults(s_dev, f->vis_pool, q0, q1 - q0, sizeof res, res, 8,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
+        return 0;
+    for (q = q0; q < q1; q++)
+        sum += (double)res[q - q0] * f->vis_scale[q];
+    return sum;
+}
+
+/* f's fence has passed: write its reports and leave the pool to be reset.
+ * open: f is still being recorded (a mid-frame flush), so the count in
+ * progress keeps what its queries found so far. */
+static void vis_collect(Frame *f, int open)
+{
+    uint32_t i;
+    if (!f->vis_pool)
+        return;
+    for (i = 0; i < f->vis_nrep; i++)
+        nv2a_pb_write_report(f->vis_rep[i].va, (uint32_t)(f->vis_rep[i].carry
+                             + vis_sum(f, f->vis_rep[i].q0, f->vis_rep[i].q1) + 0.5));
+    f->vis_nrep = 0;
+    if (open) {
+        s_vis_carry += vis_sum(f, s_vis_q0, f->vis_used);
+        s_vis_q0 = 0;
+    }
+    f->vis_used = 0;
+}
+
+static int ready(void);
+
+static void vk_report(uint32_t op, uint32_t va)
+{
+    Frame *f;
+    if (!ready() || !s_f->vis_pool)
+        return;
+    f = s_f;
+    if (op == NV2A_REPORT_CLEAR) {
+        s_vis_q0 = f->vis_used;
+        s_vis_carry = 0;
+    } else if (f->vis_nrep < VK_VIS_REPORTS) {      /* else it stays incomplete */
+        f->vis_rep[f->vis_nrep].va = va;
+        f->vis_rep[f->vis_nrep].q0 = s_vis_q0;
+        f->vis_rep[f->vis_nrep].q1 = f->vis_used;
+        f->vis_rep[f->vis_nrep].carry = s_vis_carry;
+        f->vis_nrep++;
+    }
+}
+
 static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -232,11 +308,17 @@ static void frame_begin(void)
         vkResetFences(s_dev, 1, &s_f->fence);
         s_f->submitted = 0;
     }
+    /* A count left open across the flip loses the last frame's draws. */
+    s_vis_q0 = 0;
+    s_vis_carry = 0;
+    vis_collect(s_f, 0);
     garbage_free(s_f);
     s_f->ring_off = 0;
     vkResetCommandPool(s_dev, s_f->pool, 0);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s_f->cb, &bi);
+    if (s_f->vis_pool)
+        vkCmdResetQueryPool(s_f->cb, s_f->vis_pool, 0, VK_VIS_QUERIES);
     s_cb = s_f->cb;
     s_cb_gen++;
     s_dyn_valid = 0;
@@ -719,6 +801,7 @@ typedef struct {
     uint32_t va, color, w, h, pitch, hash, bytes;
     uint32_t face;              /* cube map: bytes per face; 0 = 2D */
     uint32_t levels;            /* mip levels in the image */
+    uint32_t pal;               /* palette VA for 0x0B, else 0 */
     VkImage image; VkImageView view; VkDeviceMemory mem;
     VkFormat fmt;
     uint32_t used, checked;
@@ -1078,11 +1161,16 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     uint32_t i, hash;
     VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
     uint32_t layers = face ? 6 : 1, f, size;
+    /* An indexed texture is one image per palette: Burnout 3's traffic
+     * shares its paint indices and gives each car a palette. Keyed by
+     * address alone, every car took the palette of the first one drawn
+     * that frame, and the colours swapped from frame to frame (#11). */
+    uint32_t pal = color == 0x0B ? s_palette_va : 0;
 
     for (i = s_tex_head[tex_bucket(va, color, w, h)]; i; i = s_tex_next[i - 1]) {
         VkTex *c = &s_tex[i - 1];
         if (c->image && c->va == va && c->color == color && c->w == w && c->h == h
-            && c->face == face) {
+            && c->face == face && c->pal == pal) {
             t = c;
             break;
         }
@@ -1123,8 +1211,7 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
         if (t->image)
             tex_free(t);
         t->va = va; t->color = color; t->w = w; t->h = h; t->pitch = pitch; t->fmt = fmt;
-        t->face = face; t->levels = levels;
-        VT("texture %08X fmt %02X %ux%u pitch %u%s\n", va, color, w, h, pitch,
+        t->face = face; t->levels = levels; t->pal = pal;        VT("texture %08X fmt %02X %ux%u pitch %u%s\n", va, color, w, h, pitch,
            face ? " cube" : "");
         if (!make_image_ml(w, h, layers, levels, fmt,
                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -2379,6 +2466,8 @@ static int ready(void)
     f2.features.textureCompressionBC = s_have_bc ? VK_TRUE : VK_FALSE;
     f2.features.depthClamp = s_have_depth_clamp ? VK_TRUE : VK_FALSE;
     f2.features.samplerAnisotropy = s_aniso > 1.0f ? VK_TRUE : VK_FALSE;
+    s_vis_precise = have.occlusionQueryPrecise;
+    f2.features.occlusionQueryPrecise = s_vis_precise ? VK_TRUE : VK_FALSE;
     if (!s_headless)
         dext[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
@@ -2471,6 +2560,13 @@ static int ready(void)
         vkCreateFence(s_dev, &fci, NULL, &f->fence);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->acquired);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->rendered);
+        {
+            VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+            qpi.queryType = VK_QUERY_TYPE_OCCLUSION;
+            qpi.queryCount = VK_VIS_QUERIES;
+            if (vkCreateQueryPool(s_dev, &qpi, NULL, &f->vis_pool) != VK_SUCCESS)
+                f->vis_pool = VK_NULL_HANDLE;   /* tests stay incomplete */
+        }
         bci.size = RING_BYTES;
         bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -2523,11 +2619,14 @@ static void flush_frame_wait(void)
     vkQueueSubmit(s_queue, 1, &si, s_f->fence);
     vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
     vkResetFences(s_dev, 1, &s_f->fence);
+    vis_collect(s_f, 1);
     garbage_free(s_f);
     s_f->ring_off = 0;
     vkResetCommandPool(s_dev, s_f->pool, 0);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s_cb, &bi);
+    if (s_f->vis_pool)
+        vkCmdResetQueryPool(s_cb, s_f->vis_pool, 0, VK_VIS_QUERIES);
     s_cb_gen++;
     s_dyn_valid = 0;
 }
@@ -3067,7 +3166,8 @@ static int pend_matches(const Nv2aRawBatch *b)
 static int pend_eligible(const Nv2aRawBatch *b)
 {
     uint32_t a;
-    if (!s_inst_on || b->xform != 2 || (b->attr_present & ~b->attr_direct))
+    if (!s_inst_on || b->xform != 2 || (b->attr_present & ~b->attr_direct)
+     || (b->regs[0x17CC / 4] & 1))              /* counted: one query a draw */
         return 0;
     for (a = 0; a < NV2A_RAW_ATTRS; a++)
         if ((b->attr_direct & (1u << a))
@@ -3368,7 +3468,15 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     if (pend_eligible(b) && inst_room > 1) {
         pend_hold(b, n, ub[2].offset, inst_room);
     } else {
+        int vq = (r[0x17CC / 4] & 1) && s_f->vis_pool && s_f->vis_used < VK_VIS_QUERIES;
+        if (vq) {
+            s_f->vis_scale[s_f->vis_used] = (float)((double)s->w * s->h / ((double)s->pw * s->ph));
+            vkCmdBeginQuery(s_cb, s_f->vis_pool, s_f->vis_used,
+                            s_vis_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        }
         vkCmdDrawIndexed(s_cb, n, 1, 0, 0, 0);
+        if (vq)
+            vkCmdEndQuery(s_cb, s_f->vis_pool, s_f->vis_used++);
         s_st_calls++;
     }
     if (s_vtrace > 0)
@@ -4194,6 +4302,7 @@ static const Nv2aBackend s_backend = {
     vk_flip,
     vk_draw_raw,
     NV2A_BACKEND_RAW_DIRECT,
+    vk_report,
 };
 
 void nv2a_vk_install(void)

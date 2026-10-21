@@ -166,6 +166,23 @@ needed). This port uses the NFS toolkit fork instead (GPU renderers, Switch).
   as on PS2; TV overscan hid the rest. main.c sets RECOMP_PRESENT_CROP_Y=16
   (toolkit: GL and Vulkan present, blit and FXAA) so the picture fills the
   screen height.
+- **Sun flare through bridges and buildings (#10, fixed, toolkit):** the
+  race draws its sun sprite (one ~20x27 quad into the 640x480 scene
+  target, depth tested) inside a D3D visibility test (CLEAR_REPORT_VALUE,
+  SET_ZPASS_PIXEL_COUNT_ENABLE 1/0, GET_REPORT) and scales the lens flare
+  by the pixel count. Nothing wrote the reports, so every test stayed
+  incomplete (status 0xFFFFFFFF, slots from device+0x7D4; D3D code
+  0x0034DF80-0x0034E09D) and the flare always shone. pb_exec now hands
+  CLEAR/GET to the back end (Nv2aBackend.report); Vulkan and GL run each
+  counted draw in an occlusion query and write count + status 0 a frame or
+  two later (nv2a_pb_write_report), render scale taken out. GET_REPORT's
+  param is (phys & 0x0EFFFFFF) | 0x01000000, so report_va picks whichever
+  of the two addresses D3D marked incomplete. Forced to 0 the glare goes.
+- **Traffic colours swapping (#11, fixed, toolkit):** traffic skins are
+  512x256 P8 textures (0x0B) shared by several cars with a palette each.
+  Both texture caches keyed by address/format/size and checked once a
+  frame, so every car got the first-drawn car's palette that frame. The
+  palette VA is now part of the key for 0x0B.
 - "You have accepted an invitation to play" box after Start on every boot:
   not investigated (A dismisses it).
 

@@ -108,6 +108,9 @@ typedef ptrdiff_t     GLintptr;
 #define GL_DECR                           0x1E03
 #define GL_INVERT                         0x150A
 #define GL_REPLACE                        0x1E01
+#define GL_SAMPLES_PASSED                 0x8914
+#define GL_QUERY_RESULT                   0x8866
+#define GL_QUERY_RESULT_AVAILABLE         0x8867
 
 /* X(return type, name, parameter list) */
 #define NV2A_GL_FUNCS(X) \
@@ -189,7 +192,11 @@ X(GLboolean, glUnmapBuffer, (GLenum)) \
     X(void, glDisableVertexAttribArray, (GLuint)) \
     X(void, glVertexAttrib4f, (GLuint, GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glDrawElements, (GLenum, GLsizei, GLenum, const void *)) \
-    X(void, glDrawArrays, (GLenum, GLint, GLsizei))
+    X(void, glDrawArrays, (GLenum, GLint, GLsizei)) \
+    X(void, glGenQueries, (GLsizei, GLuint *)) \
+    X(void, glBeginQuery, (GLenum, GLuint)) \
+    X(void, glEndQuery, (GLenum)) \
+    X(void, glGetQueryObjectuiv, (GLuint, GLenum, GLuint *))
 
 #define NV2A_GL_DECLARE(ret, name, args) \
     typedef ret (GLAPIENTRY *PFN_##name) args; extern PFN_##name p_##name;
@@ -283,5 +290,9 @@ int nv2a_gl_load(void *(*getproc)(const char *name));
 #define glVertexAttrib4f         p_glVertexAttrib4f
 #define glDrawElements           p_glDrawElements
 #define glDrawArrays             p_glDrawArrays
+#define glGenQueries             p_glGenQueries
+#define glBeginQuery             p_glBeginQuery
+#define glEndQuery               p_glEndQuery
+#define glGetQueryObjectuiv      p_glGetQueryObjectuiv
 
 #endif /* NV2A_GL_API_H */

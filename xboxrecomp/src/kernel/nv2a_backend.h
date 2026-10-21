@@ -184,7 +184,23 @@ typedef struct {
     void (*draw_raw)(const Nv2aRawBatch *b);
     /* NV2A_BACKEND_* bits. */
     uint32_t flags;
+    /* Optional: visibility tests (D3D's Begin/EndVisibilityTest).
+     * NV2A_REPORT_CLEAR is CLEAR_REPORT_VALUE: the pixel count restarts at
+     * 0. NV2A_REPORT_GET is GET_REPORT: the pixels that passed the depth test
+     * in the draws made with SET_ZPASS_PIXEL_COUNT_ENABLE (regs[0x17CC / 4])
+     * on since the clear, to be written to the report at guest VA va with
+     * nv2a_pb_write_report once the back end knows them -- later is fine:
+     * until then the title sees the test incomplete. */
+    void (*report)(uint32_t op, uint32_t va);
 } Nv2aBackend;
+
+#define NV2A_REPORT_CLEAR 0u
+#define NV2A_REPORT_GET   1u
+
+/* Fill in a visibility report (from any thread): the pixel count in surface
+ * pixels as the title knows them (any resolution scale taken out), then the
+ * status word that tells D3D the test is done. */
+void nv2a_pb_write_report(uint32_t va, uint32_t pixels);
 
 /* draw_raw takes attributes in their stored format (Nv2aRawBatch.attr_direct).
  * RECOMP_GL_DIRECT=0 turns it off at run time. */
