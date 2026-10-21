@@ -941,11 +941,14 @@ static void prof_start(void)
  * and the clocks stayed at the system's after HOME. More heat and battery:
  * opt-in.
  *
- * Clock managers (sys-clk "sys:clk", Horizon OC "hoc:clk") set clocks
- * themselves -- Horizon OC puts stock rates back every tick when the game has
- * no profile -- and fighting them every second froze consoles (issue #25).
- * So: when one is running, the NFSU2_*_MHZ lines are ignored (the manager's
- * profile rules; NFSU2_CLOCK_FORCE=1 overrides); a rate already at or above
+ * Clock managers set clocks themselves. Horizon OC ("hoc:clk") puts stock
+ * rates back every tick when the game has no profile, and fighting it every
+ * second froze consoles (nfsu2-sw issue #25), so while it runs the
+ * NFSU2_*_MHZ lines are ignored (its profile rules; NFSU2_CLOCK_FORCE=1
+ * overrides). sys-clk ("sys:clk") leaves a title without a profile alone:
+ * ignoring the lines under it too left v0.2.1 at stock 1020 MHz CPU for
+ * everyone who had it installed (b3x issue #9). For it, and for anything
+ * else: a rate already at or above
  * the request is left alone, at boot and later (never lower someone else's
  * overclock); and a module that is put back more than 5 times in 30 s with
  * no dock/focus/sleep change in between is given up to whoever does it. */
@@ -1108,8 +1111,7 @@ static void clk_apply(void)
         return;
     {
         const char *f = getenv("NFSU2_CLOCK_FORCE");
-        const char *tool = clk_service_running("hoc:clk") ? "Horizon OC"
-                         : clk_service_running("sys:clk") ? "sys-clk" : NULL;
+        const char *tool = clk_service_running("hoc:clk") ? "Horizon OC" : NULL;
         if (tool && !(f && *f == '1')) {
             printf("[clock] %s is running: NFSU2_*_MHZ ignored, set clocks in its "
                    "profile (NFSU2_CLOCK_FORCE=1 overrides)\n", tool);
