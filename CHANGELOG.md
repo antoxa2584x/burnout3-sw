@@ -4,6 +4,14 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.5] - 2026-11-01
+
+### Changed
+- Faster movie colour conversion (#6): the menu background movie
+  (`_FEMain.xmv`) slowed the menus to 7-25 fps on the Switch, with the CPU
+  busy decoding it. The YUV-to-RGB step, a third of that time, now does four
+  pixels at once (NEON on the Switch, SSE2 on x86) with bit-identical output.
+
 ## [0.2.4] - 2026-10-21
 
 ### Fixed
@@ -45,7 +53,7 @@ First Switch/Linux release on the NFS toolkit fork.
 - Profiles saved after racing came back "Unusable": the kernel's key
   exports sat inside the game's own data and were overwritten.
 
-## [Unreleased]
+## [0.2.5] - 2026-11-01
 
 The project now runs on the shared xboxrecomp runtime instead of its own fork,
 and the title boots and plays through its own code. Needs xboxrecomp

@@ -183,6 +183,18 @@ needed). This port uses the NFS toolkit fork instead (GPU renderers, Switch).
   Both texture caches keyed by address/format/size and checked once a
   frame, so every car got the first-drawn car's palette that frame. The
   palette VA is now part of the key for 0x0B.
+- **Menu slowdown on Switch (#6, partly):** the menus play `_FEMain.xmv`
+  behind them; prof.bin from a user (docked, Horizon OC, stock-ish CPU)
+  had the game thread 94-98% busy at 7-25 fps, all in the XMV player:
+  ~33% the YUV converter (sub_002CD892, native xmv_yuv_native), ~60% the
+  lifted WMV decoder (sub_002CE*/002D* under GetNextFrame 0x2CCB1C).
+  Frames went 60 ms -> 180+ ms for the same movie (player catching up?).
+  The converter is now 4-wide (xmv_quad4: NEON fcvtns + range mask, SSE2
+  cvtps2dq; fp-contract=off or GCC fuses into fmla and differs). Verified
+  with RECOMP_NATIVE_CHECK=1 on Linux (0 mismatches) and a qemu-aarch64
+  harness against xmv_quad (scratch test, not in the repo). Switch build
+  has `-mtp=soft`: every guest register access calls __aarch64_read_tp
+  (~4-6% self in the lifted decoder).
 - "You have accepted an invitation to play" box after Start on every boot:
   not investigated (A dismisses it).
 

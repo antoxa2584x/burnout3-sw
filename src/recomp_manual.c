@@ -24,6 +24,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -478,6 +483,87 @@ static inline RecompXmm xmv_chroma(RecompXmm x, RecompMmx c)
     return XMM_SHUFFLE(x, x, 0x50);
 }
 
+/* The same four pixels as xmv_quad, as 4-lane vectors (NEON on the Switch,
+ * SSE2 on x86). Every lane is one pixel: luma L = (y + bias) * weight as
+ * pmaddwd and cvtpi2ps give it, then B = U*x4 + L, R = V*x7 + L,
+ * G = (L + V*x5) + U*x6, in that order, each rounded once. xmv_quad only
+ * shuffles these lanes into the two MMX halves. A third of the game thread
+ * in the menu movie was the scalar version (#6). */
+typedef float    XmvV4f __attribute__((vector_size(16)));
+typedef int32_t  XmvV4i __attribute__((vector_size(16)));
+typedef uint32_t XmvV4u __attribute__((vector_size(16)));
+
+typedef struct {
+    XmvV4u m5a, m5b;        /* pmaddwd weights for pixel 0..3: [w0 w2 w0 w2], [w1 w3 w1 w3] */
+    XmvV4i alpha;           /* mm7 dwords << 20 */
+    XmvV4f x4, x5, x6, x7;
+    uint16_t m7w[4];        /* luma bias per pixel */
+} XmvVec;
+
+static inline XmvV4f xmv_v4f(RecompXmm x)
+{
+    XmvV4f v;
+    memcpy(&v, x.f, 16);
+    return v;
+}
+
+static void xmv_vec_init(XmvVec *v, const XmvCoef *k)
+{
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        v->m5a[i] = (uint32_t)(int32_t)k->m5.w[(i & 1) * 2];
+        v->m5b[i] = (uint32_t)(int32_t)k->m5.w[(i & 1) * 2 + 1];
+        v->alpha[i] = (int32_t)(k->m7.ud[i & 1] << 20);
+        v->m7w[i] = k->m7.uw[i];
+    }
+    v->x4 = xmv_v4f(k->x4);
+    v->x5 = xmv_v4f(k->x5);
+    v->x6 = xmv_v4f(k->x6);
+    v->x7 = xmv_v4f(k->x7);
+}
+
+/* xmv_u8 on four lanes */
+static inline XmvV4i xmv_u8x4(XmvV4f f)
+{
+    const XmvV4i zero = { 0, 0, 0, 0 }, max = { 255, 255, 255, 255 };
+    XmvV4i i;
+#if defined(__aarch64__)
+    const XmvV4f lo = { -2147483648.0f, -2147483648.0f, -2147483648.0f, -2147483648.0f };
+    const XmvV4f hi = { 2147483648.0f, 2147483648.0f, 2147483648.0f, 2147483648.0f };
+
+    /* fcvtns saturates; cvtps2pi's 0x80000000 (NaN, out of range) ends as 0 */
+    i = (XmvV4i)vcvtnq_s32_f32((float32x4_t)f) & ((f >= lo) & (f < hi));
+#elif defined(__SSE2__)
+    i = (XmvV4i)_mm_cvtps_epi32((__m128)f);
+#else
+    int n;
+    for (n = 0; n < 4; n++)
+        i[n] = (int32_t)xmv_u8(f[n]) << 15;
+#endif
+    i >>= 15;
+    i &= ~(i < zero);
+    return (i & ~(i > max)) | (max & (i > max));
+}
+
+__attribute__((optimize("fp-contract=off")))
+static inline void xmv_quad4(const XmvVec *v, uint32_t y, XmvV4f u, XmvV4f w, uint32_t dst)
+{
+    XmvV4u a;
+    XmvV4f l, b, r, g;
+    XmvV4i p;
+    int i;
+
+    for (i = 0; i < 4; i++)                     /* punpcklbw, paddw */
+        a[i] = (uint32_t)(int32_t)(int16_t)(uint16_t)(((y >> (8 * i)) & 0xFFu) + v->m7w[i]);
+    l = __builtin_convertvector((XmvV4i)(a * v->m5a + a * v->m5b), XmvV4f);
+    b = u * v->x4 + l;
+    r = w * v->x7 + l;
+    g = (l + w * v->x5) + u * v->x6;
+    p = v->alpha | xmv_u8x4(b) | (xmv_u8x4(g) << 8) | (xmv_u8x4(r) << 16);
+    memcpy((void *)XBOX_PTR(dst), &p, 16);
+}
+
 __attribute__((optimize("fp-contract=off")))
 static void xmv_yuv_native(void)
 {
@@ -489,7 +575,11 @@ static void xmv_yuv_native(void)
     XmvCoef k = { mm4, mm5, mm7, xmm4, xmm5, xmm6, xmm7 };
     RecompMmx m6 = mm6, r0 = mm0, r1 = mm1, r2 = mm2, r3 = mm3, u, v;
     RecompXmm x0 = xmm0, x1 = xmm1, x2 = xmm2, x3 = xmm3;
+    int vec = k.m4.q == 0;                      /* mm4 is the zero register here */
+    XmvVec kv;
 
+    if (vec)
+        xmv_vec_init(&kv, &k);
     for (n = 16;;) {
         u = MMX_PUNPCKLBW(MMX_FROM32(xmv_ld32(us)), k.m4);
         r3 = u;
@@ -499,24 +589,35 @@ static void xmv_yuv_native(void)
         x2 = xmv_chroma(x2, MMX_PADDD(MMX_PUNPCKLWD(v, k.m4), m6));
         r3 = MMX_PUNPCKHWD(r3, r1);
 
-        xmv_quad(&k, MMX_FROM32(xmv_ld32(ys)), x1, x2, &x0, &x3, &r0, &r1);
-        MMX_STORE(dst, r0);
-        MMX_STORE(dst + 8, r1);
-        xmv_quad(&k, MMX_FROM32(xmv_ld32(ys + ypitch)), x1, x2, &x0, &x3, &r0, &r1);
-        MMX_STORE(dst + dpitch, r0);
-        MMX_STORE(dst + dpitch + 8, r1);
+        if (vec) {
+            xmv_quad4(&kv, xmv_ld32(ys), xmv_v4f(x1), xmv_v4f(x2), dst);
+            xmv_quad4(&kv, xmv_ld32(ys + ypitch), xmv_v4f(x1), xmv_v4f(x2), dst + dpitch);
+        } else {
+            xmv_quad(&k, MMX_FROM32(xmv_ld32(ys)), x1, x2, &x0, &x3, &r0, &r1);
+            MMX_STORE(dst, r0);
+            MMX_STORE(dst + 8, r1);
+            xmv_quad(&k, MMX_FROM32(xmv_ld32(ys + ypitch)), x1, x2, &x0, &x3, &r0, &r1);
+            MMX_STORE(dst + dpitch, r0);
+            MMX_STORE(dst + dpitch + 8, r1);
+        }
 
         r0 = MMX_PADDD(MMX_PSRLD(MMX_PSLLD(r3, 16u), 16u), m6);
         x1 = xmv_chroma(x1, r0);
         r3 = MMX_PADDD(MMX_PSRLD(r3, 16u), m6);
         x2 = xmv_chroma(x2, r3);
 
-        xmv_quad(&k, MMX_FROM32(xmv_ld32(ys + 4)), x1, x2, &x0, &x3, &r0, &r1);
-        MMX_STORE(dst + 0x10, r0);
-        MMX_STORE(dst + 0x18, r1);
-        xmv_quad(&k, MMX_FROM32(xmv_ld32(ys + ypitch + 4)), x1, x2, &x0, &x3, &r0, &r1);
-        MMX_STORE(dst + dpitch + 0x10, r0);
-        MMX_STORE(dst + dpitch + 0x18, r1);
+        if (vec) {
+            xmv_quad4(&kv, xmv_ld32(ys + 4), xmv_v4f(x1), xmv_v4f(x2), dst + 0x10);
+            xmv_quad4(&kv, xmv_ld32(ys + ypitch + 4), xmv_v4f(x1), xmv_v4f(x2),
+                      dst + dpitch + 0x10);
+        } else {
+            xmv_quad(&k, MMX_FROM32(xmv_ld32(ys + 4)), x1, x2, &x0, &x3, &r0, &r1);
+            MMX_STORE(dst + 0x10, r0);
+            MMX_STORE(dst + 0x18, r1);
+            xmv_quad(&k, MMX_FROM32(xmv_ld32(ys + ypitch + 4)), x1, x2, &x0, &x3, &r0, &r1);
+            MMX_STORE(dst + dpitch + 0x10, r0);
+            MMX_STORE(dst + dpitch + 0x18, r1);
+        }
 
         if (--n == 0)
             break;
@@ -529,6 +630,8 @@ static void xmv_yuv_native(void)
             vs += uvpitch - 4;
         }
     }
+    if (vec)    /* the registers the scalar steps leave: its last quad again */
+        xmv_quad(&k, MMX_FROM32(xmv_ld32(ys + ypitch + 4)), x1, x2, &x0, &x3, &r0, &r1);
     /* r2 is only the packing scratch: the last value it held */
     r2 = xmv_pack(x0.f[0], x0.f[1], k.m4);
     r2 = MMX_PSLLQ(r2, 8u);
